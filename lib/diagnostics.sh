@@ -1,0 +1,68 @@
+# shellcheck shell=bash
+command_status() {
+  validate_iface
+  read_metadata
+  if ! ip link show "$IFACE" >/dev/null 2>&1; then
+    log ERROR "Interface '$IFACE' is not currently present. Start it with 'systemctl start wg-quick@$IFACE' or 'rc-service wg-quick.$IFACE start', then re-run."
+    return 1
+  fi
+  if ! wg show "$IFACE" 2>/dev/null; then
+    log ERROR "Could not read WireGuard status for '$IFACE'. Verify permissions and service state."
+    return 1
+  fi
+}
+command_doctor() {
+  distro_detect
+  validate_iface
+  read_metadata
+  local fail=0
+  printf 'Doctor report for %s (%s mode)\n' "$IFACE" "$MODE"
+  if command -v wg >/dev/null 2>&1; then
+    printf '  [ok] wireguard-tools is installed\n'
+  else
+    printf '  [FAIL] wireguard-tools missing: install wireguard-tools and the kernel module for %s\n' "$DISTRO"
+    fail=1
+  fi
+  if ip link show "$IFACE" >/dev/null 2>&1; then
+    printf '  [ok] interface is present\n'
+  else
+    printf '  [FAIL] interface is down: start wg-quick@%s or rc-service wg-quick.%s\n' "$IFACE" "$IFACE"
+    fail=1
+  fi
+  if [[ $(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0) == 1 ]]; then
+    printf '  [ok] IPv4 forwarding is enabled\n'
+  else
+    printf '  [FAIL] IPv4 forwarding is disabled: enable it through %s/99-wg-manager-%s.conf\n' "$SYSCTL_DIR" "$IFACE"
+    fail=1
+  fi
+  if [[ -n $IPV6 ]]; then
+    if [[ $(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || echo 0) == 1 ]]; then
+      printf '  [ok] IPv6 forwarding is enabled\n'
+    else
+      printf '  [FAIL] IPv6 forwarding is disabled: enable net.ipv6.conf.all.forwarding\n'
+      fail=1
+    fi
+  fi
+  if ss -lun 2>/dev/null | awk '{print $5}' | grep -q ":$PORT$"; then
+    printf '  [ok] UDP port %s is listening\n' "$PORT"
+  else
+    printf '  [FAIL] UDP port %s is not listening: check the firewall and service logs\n' "$PORT"
+    fail=1
+  fi
+  printf '  [info] active firewall backend: %s\n' "$(detect_firewall)"
+  if [[ $MODE == full ]]; then
+    if iptables -t nat -S POSTROUTING 2>/dev/null | grep -q "MASQUERADE.*-o $WAN"; then
+      printf '  [ok] full-tunnel MASQUERADE rule is present\n'
+    else
+      printf '  [WARN] MASQUERADE rule not found: rerun reconfigure --mode full or review firewall setup\n'
+      fail=1
+    fi
+  fi
+  if getent hosts example.com >/dev/null 2>&1; then
+    printf '  [ok] DNS resolution works\n'
+  else
+    printf '  [FAIL] DNS resolution failed: check /etc/resolv.conf or the selected DNS provider\n'
+    fail=1
+  fi
+  (( fail == 0 )) || return 1
+}
