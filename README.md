@@ -17,7 +17,7 @@ The tool can:
 | Mode | What client traffic uses the tunnel |
 | --- | --- |
 | Hub-and-spoke (`hub`) | The tunnel subnet. |
-| Full-tunnel (`full`) | All IPv4 and IPv6 traffic. You can choose split-tunnel routes instead. |
+| Full-tunnel (`full`) | All IPv4 traffic. IPv6 is not routed through the tunnel. You can choose split-tunnel routes instead. |
 
 During installation the tool writes a server config at `/etc/wireguard/<interface>.conf`, stores keys and records under `/var/lib/wg-manager`, enables IP forwarding in `/etc/sysctl.d`, adds firewall rules through UFW, firewalld, or iptables, and starts a `wg-quick` service through systemd or OpenRC. If the new interface fails to start, the tool removes the changes it made.
 
@@ -230,22 +230,16 @@ Doctor report for wg0 (hub mode)
   [ok] DNS resolution works
 ```
 
-Full-tunnel mode adds a MASQUERADE rule check. If you set an IPv6 CIDR, the report adds an IPv6 forwarding check. Any `[FAIL]` line makes the report return a failure status. The MASQUERADE `[WARN]` line does too.
+Full-tunnel mode adds a MASQUERADE rule check and reports that IPv6 is not routed through this IPv4-only tunnel. If you set an IPv6 CIDR, the report adds an IPv6 forwarding check. Any `[FAIL]` line makes the report return a failure status. The MASQUERADE `[WARN]` line does too.
 
-### 3.6 Reconfigure hub/full mode — known limitation
+### 3.6 Reconfigure hub/full mode
 
-Interface menu option `8` is present, but the current code always fails when you select it:
-
-```text
-Reconfigure requires --mode hub or --mode full.
-```
-
-The tool reads a setting that the menu never supplies. There is no working mode switch in this version. Do not rely on this option to change a live interface.
+Interface menu option `8` switches between hub and full mode. The non-interactive CLI accepts `--reconfigure --mode <hub|full> --iface <name>`. Full mode routes IPv4 only; IPv6 traffic is not protected by this tunnel. The tool updates firewall rules and client `AllowedIPs` when switching modes.
 
 ### 3.7 Back up and restore
 
-- **Back up interface** (option `9`) asks for a file name. Press Enter to use `<interface>-backup-<timestamp>.tar.gz` in the current directory. After the dry-run question, it saves the server config, interface state, client files, and sysctl file into a gzip tar archive with mode `600`. It prints a SHA-256 checksum and the file path.
-- **Restore backup** (option `10`) asks for the archive path and the dry-run question, then asks `Restore WireGuard backup '<file>'? This may replace managed files.`. It validates the archive, reads the interface name from the archive metadata, extracts the files, reapplies forwarding and firewall rules, and starts the service. Keep the archive until you confirm the restore worked.
+- **Back up interface** (option `9`) asks for a file name. Press Enter to use `<interface>-backup-<timestamp>.tar.gz` in the current directory. After the dry-run question, it saves the server config, interface state, client files, and sysctl file into a gzip tar archive with mode `600`. It prints a SHA-256 checksum and the file path. Existing destinations, including symlinks, are not overwritten.
+- **Restore backup** (option `10`) asks for the archive path and the dry-run question, then asks `Restore WireGuard backup '<file>'? This may replace managed files.`. It validates the archive and metadata before the dry run or installation, reads the interface name from the archive metadata, extracts the files, reapplies forwarding and firewall rules, and starts the service. Keep the archive until you confirm the restore worked.
 
 ### 3.8 Uninstall an interface
 
@@ -278,13 +272,15 @@ Client configs, private keys, preshared keys, server keys, backups, and QR codes
 | `--backup` | Back up the interface | |
 | `--restore` | Restore from a backup | Requires `WG_BACKUP_FILE`. |
 | `--uninstall` | Uninstall the interface | |
+| `--reconfigure` | Change an installed interface between hub and full mode | Requires `--mode`. |
+| `--mode <hub|full>` | Target mode | Used with `--reconfigure`; install mode remains in `WG_MODE`. |
 | `--iface <name>` | Interface name | Overrides `WG_IFACE` from the preset. |
 | `--preset <file>` | Load a preset file | See section 4.2. |
 | `--dry-run` | Preview without making changes | |
 | `--yes` / `--auto` | Auto-confirm all prompts | |
 | `--help` / `-h` | Show usage | |
 
-There are no flags for individual settings such as mode, subnet, port, or endpoint; put those values in a preset file.
+Other settings such as subnet, port, and endpoint are provided in a preset file.
 
 ### 4.2 Preset files
 
@@ -366,7 +362,7 @@ Errors such as `WG_MODE is required in the preset (hub or full).` or `WG_CLIENT 
 | `Backup creation failed for '<iface>'. Check the output path and available disk space.` | Check that the output directory exists and has free space. |
 | `Backup file '<file>' does not exist.` / `is not a valid gzip tar archive` / `has no usable interface metadata` | Check the path, or create a new backup with option `9`. Restoring requires the archive to contain a `metadata` file. |
 | `Status is unavailable; see the error above.` | The interface is down. Start it with the command printed by `6) Show status`, then retry. |
-| `Reconfigure requires --mode hub or --mode full.` | This is the known limitation in section 3.6. The current menu cannot switch modes. |
+| `Reconfigure requires --mode hub or --mode full.` | Supply `--mode hub` or `--mode full` with `--reconfigure`, or use menu option `8`. |
 
 Doctor report lines and what they mean:
 
@@ -378,6 +374,7 @@ Doctor report lines and what they mean:
 | `[FAIL] IPv6 forwarding is disabled` | Enable `net.ipv6.conf.all.forwarding`. The tool writes this setting when you configure an IPv6 CIDR. |
 | `[FAIL] UDP port <port> is not listening` | Check the firewall and the service logs. |
 | `[WARN] MASQUERADE rule not found` | Shown in full-tunnel mode when the tool cannot find an iptables NAT rule. Review the firewall setup before treating it as an outage. |
+| `[info] IPv6 traffic is not routed through this IPv4-only full tunnel` | IPv6 is outside the VPN tunnel; use a separate IPv6-capable VPN or disable IPv6 on clients if it must not use the local network. |
 | `[FAIL] DNS resolution failed` | Check `/etc/resolv.conf` or the selected DNS provider. |
 
-Several error messages name options. Use only the options from section 4 and `--help`, `-h`, `--prepare`, and `--prepare-install`. Other option names such as `--subnet`, `--mode`, or `--endpoint` are not accepted; set those values in the preset file or at the menu prompts.
+Several error messages may name options. Use the supported options from section 4 and `--help`, `-h`, `--prepare`, and `--prepare-install`. Values such as subnet and endpoint belong in the preset file or menu prompts; `--mode` is supported with `--reconfigure`.

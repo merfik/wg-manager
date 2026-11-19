@@ -113,7 +113,7 @@ generate_client_config() {
   local client_ip=$2 client_private=$3 server_public=$4 psk=$5
   local allowed dns_lines=""
   if [[ $MODE == full && $SPLIT_TUNNEL != 1 ]]; then
-    allowed="0.0.0.0/0, ::/0"
+    allowed="0.0.0.0/0"
   else
     allowed=$SUBNET
     if [[ -n ${ROUTES:-} ]]; then allowed="$allowed, ${ROUTES//,/ ,}"
@@ -244,8 +244,8 @@ remove_ufw_nat() {
     return 0
   fi
   if [[ -f $rules_file ]] && grep -q -- "# BEGIN wg-manager $IFACE" "$rules_file"; then
-    ufw_nat_remove_block "$rules_file" || log WARN "Could not remove the NAT block for '$IFACE' from $rules_file."
-    ufw --force reload >/dev/null 2>&1 || log WARN "ufw reload failed while removing NAT rules for '$IFACE'."
+    ufw_nat_remove_block "$rules_file" || die "Could not remove the NAT block for '$IFACE' from $rules_file."
+    ufw --force reload >/dev/null 2>&1 || die "ufw reload failed while removing NAT rules for '$IFACE'."
   fi
   rm -f "$state" "$(metadata_dir)/ufw-masq"
 }
@@ -253,9 +253,13 @@ add_firewall_rules() {
   local firewall=$1
   case "$firewall" in
     ufw)
-      [[ $DRY_RUN == 1 ]] || ufw allow "$PORT"/udp >/dev/null
+      if [[ $DRY_RUN != 1 ]]; then
+        ufw allow "$PORT"/udp >/dev/null || die "Could not allow UDP port $PORT in UFW."
+      fi
       if [[ $MODE == full ]]; then
-        [[ $DRY_RUN == 1 ]] || ufw route allow in on "$IFACE" out on "$WAN" >/dev/null
+        if [[ $DRY_RUN != 1 ]]; then
+          ufw route allow in on "$IFACE" out on "$WAN" >/dev/null || die "Could not add the full-tunnel UFW route for '$IFACE'."
+        fi
         apply_ufw_nat "$WAN"
       fi
       ;;
@@ -284,27 +288,65 @@ add_firewall_rules() {
       ;;
   esac
 }
+remove_full_tunnel_rules() {
+  local firewall=$1
+  case "$firewall" in
+    ufw)
+      ufw route delete allow in on "$IFACE" out on "$WAN" >/dev/null 2>&1 ||
+        die "Could not remove the full-tunnel UFW route for '$IFACE'."
+      remove_ufw_nat
+      ;;
+    firewalld)
+      firewall-cmd --permanent --zone=external --remove-interface="$WAN" >/dev/null ||
+        die "Could not remove WAN interface '$WAN' from the firewalld external zone."
+      firewall-cmd --permanent --zone=external --remove-masquerade >/dev/null ||
+        die "Could not disable firewalld masquerading."
+      firewall-cmd --reload >/dev/null || die "Could not reload firewalld after removing full-tunnel rules."
+      ;;
+    iptables)
+      iptables -t nat -D POSTROUTING -o "$WAN" -j MASQUERADE >/dev/null 2>&1 ||
+        die "Could not remove the full-tunnel iptables MASQUERADE rule for '$WAN'."
+      ;;
+    *) die "Unsupported firewall backend '$firewall'." ;;
+  esac
+}
 remove_firewall_rules() {
   local firewall=$1
   case "$firewall" in
     ufw)
-      ufw delete allow "$PORT"/udp >/dev/null 2>&1 || true
-      ufw route delete allow in on "$IFACE" out on "$WAN" >/dev/null 2>&1 || true
+      ufw delete allow "$PORT"/udp >/dev/null 2>&1 || die "Could not remove the UFW UDP port rule for '$IFACE'."
+      if [[ $MODE == full ]]; then
+        ufw route delete allow in on "$IFACE" out on "$WAN" >/dev/null 2>&1 ||
+          die "Could not remove the UFW full-tunnel route for '$IFACE'."
+      fi
       remove_ufw_nat
       ;;
     firewalld)
-      firewall-cmd --permanent --remove-port="$PORT"/udp >/dev/null 2>&1 || true
-      firewall-cmd --permanent --zone=trusted --remove-interface="$IFACE" >/dev/null 2>&1 || true
-      firewall-cmd --permanent --zone=external --remove-interface="$WAN" >/dev/null 2>&1 || true
-      firewall-cmd --permanent --zone=external --remove-masquerade >/dev/null 2>&1 || true
-      firewall-cmd --reload >/dev/null 2>&1 || true
+      firewall-cmd --permanent --remove-port="$PORT"/udp >/dev/null 2>&1 ||
+        die "Could not remove UDP port $PORT from firewalld."
+      firewall-cmd --permanent --zone=trusted --remove-interface="$IFACE" >/dev/null 2>&1 ||
+        die "Could not remove '$IFACE' from the firewalld trusted zone."
+      if [[ $MODE == full ]]; then
+        firewall-cmd --permanent --zone=external --remove-interface="$WAN" >/dev/null 2>&1 ||
+          die "Could not remove '$WAN' from the firewalld external zone."
+        firewall-cmd --permanent --zone=external --remove-masquerade >/dev/null 2>&1 ||
+          die "Could not disable firewalld masquerading."
+      fi
+      firewall-cmd --reload >/dev/null 2>&1 || die "Could not reload firewalld after rule removal."
       ;;
     iptables)
-      iptables -D INPUT -p udp --dport "$PORT" -j ACCEPT >/dev/null 2>&1 || true
-      iptables -D FORWARD -i "$IFACE" -j ACCEPT >/dev/null 2>&1 || true
-      iptables -D FORWARD -o "$IFACE" -j ACCEPT >/dev/null 2>&1 || true
-      iptables -t nat -D POSTROUTING -o "$WAN" -j MASQUERADE >/dev/null 2>&1 || true
+      iptables -D INPUT -p udp --dport "$PORT" -j ACCEPT >/dev/null 2>&1 ||
+        die "Could not remove the iptables UDP port rule for '$IFACE'."
+      iptables -D FORWARD -i "$IFACE" -j ACCEPT >/dev/null 2>&1 ||
+        die "Could not remove the iptables forwarding rule for '$IFACE'."
+      iptables -D FORWARD -o "$IFACE" -j ACCEPT >/dev/null 2>&1 ||
+        die "Could not remove the iptables forwarding rule for '$IFACE'."
+      if [[ $MODE == full ]]; then
+        iptables -t nat -D POSTROUTING -o "$WAN" -j MASQUERADE >/dev/null 2>&1 ||
+          die "Could not remove the iptables MASQUERADE rule for '$WAN'."
+      fi
       ;;
+    *) die "Unsupported firewall backend '$firewall'." ;;
   esac
 }
 enable_forwarding() {

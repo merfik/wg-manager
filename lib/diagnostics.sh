@@ -50,7 +50,10 @@ command_doctor() {
     fail=1
   fi
   printf '  [info] active firewall backend: %s\n' "$(detect_firewall)"
-  local -a peer_ips=() dupes=() non32=()
+  if [[ $MODE == full ]]; then
+    printf '  [info] IPv6 traffic is not routed through this IPv4-only full tunnel\n'
+  fi
+  local -a dupes=() non32=()
   local peer_entry host
   local -A seen=()
   while IFS= read -r peer_entry; do

@@ -61,7 +61,8 @@ setup() {
   MODE=full
   DNS=cloudflare
   output=$(generate_client_config phone 10.7.0.2/24 private-key server-key "")
-  [[ "$output" == *"AllowedIPs = 0.0.0.0/0, ::/0"* ]]
+  [[ "$output" == *"AllowedIPs = 0.0.0.0/0"* ]]
+  [[ "$output" != *"::/0"* ]]
   [[ "$output" == *"DNS = 1.1.1.1,1.0.0.1"* ]]
 }
 
@@ -466,6 +467,161 @@ setup() {
   [ "$SUBNET" = 10.7.0.0/24 ]
   grep -q 'ListenPort = 51820' "$WG_MANAGER_ETC_ROOT/wg0.conf"
   grep -q 'net.ipv4.ip_forward=1' "$WG_MANAGER_SYSCTL_DIR/99-wg-manager-wg0.conf"
+}
+
+@test "restore dry run validates archive and preserves existing exit trap" {
+  require_root() { return 0; }
+  local stage="$BATS_TEST_TMPDIR/dry-run-restore"
+  mkdir -p "$stage/${WG_MANAGER_STATE_ROOT#/}/interfaces/wg0" "$stage/${WG_MANAGER_ETC_ROOT#/}"
+  printf 'MODE=hub\nIFACE=wg0\nSUBNET=10.7.0.0/24\nIPV6=\nPORT=51820\nENDPOINT=192.0.2.10\nDNS=system\nMTU=1420\nKEEPALIVE=25\nWAN=\nFIREWALL=iptables\nSERVICE_BACKEND=systemd\nSPLIT_TUNNEL=0\nROUTES=\nPSK=0\n' >"$stage/${WG_MANAGER_STATE_ROOT#/}/interfaces/wg0/metadata"
+  printf '[Interface]\n' >"$stage/${WG_MANAGER_ETC_ROOT#/}/wg0.conf"
+  tar -czf "$BATS_TEST_TMPDIR/dry-run.tar.gz" -C "$stage" \
+    "${WG_MANAGER_STATE_ROOT#/}/interfaces/wg0/metadata" \
+    "${WG_MANAGER_ETC_ROOT#/}/wg0.conf"
+  ARGS=("$BATS_TEST_TMPDIR/dry-run.tar.gz")
+  DRY_RUN=1
+  local prior_trap
+  prior_trap=$(trap -p EXIT || true)
+  run command_restore
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"validated backup for wg0"* ]]
+  [ "$(trap -p EXIT || true)" = "$prior_trap" ]
+
+  printf 'not a tar archive\n' >"$BATS_TEST_TMPDIR/not-an-archive"
+  ARGS=("$BATS_TEST_TMPDIR/not-an-archive")
+  run command_restore
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"not a valid gzip tar archive"* ]]
+}
+
+@test "restore rejects invalid metadata before installing files" {
+  require_root() { return 0; }
+  local stage="$BATS_TEST_TMPDIR/bad-metadata"
+  mkdir -p "$stage/${WG_MANAGER_STATE_ROOT#/}/interfaces/wg0" "$stage/${WG_MANAGER_ETC_ROOT#/}"
+  printf 'MODE=hub\nIFACE=wg0\nSUBNET=not-a-cidr\nPORT=51820\nDNS=system\nFIREWALL=iptables\nSERVICE_BACKEND=systemd\n' >"$stage/${WG_MANAGER_STATE_ROOT#/}/interfaces/wg0/metadata"
+  printf 'must not install\n' >"$stage/${WG_MANAGER_ETC_ROOT#/}/wg0.conf"
+  tar -czf "$BATS_TEST_TMPDIR/bad-metadata.tar.gz" -C "$stage" \
+    "${WG_MANAGER_STATE_ROOT#/}/interfaces/wg0/metadata" \
+    "${WG_MANAGER_ETC_ROOT#/}/wg0.conf"
+  ARGS=("$BATS_TEST_TMPDIR/bad-metadata.tar.gz")
+  DRY_RUN=1
+  run command_restore
+  [ "$status" -ne 0 ]
+  [ ! -e "$WG_MANAGER_ETC_ROOT/wg0.conf" ]
+}
+
+@test "backup refuses a symlink destination without changing its target" {
+  require_root() { return 0; }
+  MODE=hub
+  WAN=
+  FIREWALL=iptables
+  SERVICE_BACKEND=systemd
+  write_metadata
+  printf 'sentinel\n' >"$BATS_TEST_TMPDIR/target"
+  ln -s "$BATS_TEST_TMPDIR/target" "$BATS_TEST_TMPDIR/backup.tar.gz"
+  OUTPUT="$BATS_TEST_TMPDIR/backup.tar.gz"
+  run command_backup
+  [ "$status" -ne 0 ]
+  [ "$(cat "$BATS_TEST_TMPDIR/target")" = sentinel ]
+}
+
+@test "backup creates a private archive and refuses overwrite" {
+  require_root() { return 0; }
+  MODE=hub
+  WAN=
+  FIREWALL=iptables
+  SERVICE_BACKEND=systemd
+  write_metadata
+  printf '[Interface]\n' >"$WG_MANAGER_ETC_ROOT/wg0.conf"
+  mkdir -p "$WG_MANAGER_SYSCTL_DIR"
+  printf 'net.ipv4.ip_forward=1\n' >"$WG_MANAGER_SYSCTL_DIR/99-wg-manager-wg0.conf"
+  cd "$BATS_TEST_TMPDIR"
+  OUTPUT=wg0-backup.tar.gz
+  command_backup >/dev/null
+  [ "$(stat -c %a "$OUTPUT")" = 600 ]
+  run command_backup
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"already exists"* ]]
+}
+
+@test "full-to-hub firewall cleanup removes only full-tunnel rules" {
+  local calls="$BATS_TEST_TMPDIR/firewall-calls"
+  : >"$calls"
+  iptables() { printf '%s\n' "$*" >>"$calls"; }
+  IFACE=wg0
+  WAN=eth0
+  MODE=hub
+  remove_full_tunnel_rules iptables
+  [ "$(cat "$calls")" = "-t nat -D POSTROUTING -o eth0 -j MASQUERADE" ]
+}
+
+@test "UFW full-to-hub cleanup retains the interface port rule" {
+  local rules="$BATS_TEST_TMPDIR/reconfigure-before.rules" calls="$BATS_TEST_TMPDIR/ufw-calls"
+  printf '# BEGIN wg-manager wg0\n*nat\nCOMMIT\n# END wg-manager wg0\n*filter\nCOMMIT\n' >"$rules"
+  printf 'managed nat\n' >"$WG_MANAGER_STATE_ROOT/interfaces/wg0/ufw-nat.rules"
+  export WG_MANAGER_UFW_RULES=$rules
+  : >"$calls"
+  ufw() { printf '%s\n' "$*" >>"$calls"; }
+  IFACE=wg0
+  WAN=eth0
+  DRY_RUN=0
+  remove_full_tunnel_rules ufw
+  grep -q '^route delete allow in on wg0 out on eth0$' "$calls"
+  ! grep -q 'delete allow 51820/udp' "$calls"
+  ! grep -q 'BEGIN wg-manager wg0' "$rules"
+  [ ! -e "$WG_MANAGER_STATE_ROOT/interfaces/wg0/ufw-nat.rules" ]
+}
+
+@test "firewalld full-to-hub cleanup removes only external NAT routing" {
+  local calls="$BATS_TEST_TMPDIR/firewalld-calls"
+  : >"$calls"
+  firewall-cmd() { printf '%s\n' "$*" >>"$calls"; }
+  WAN=eth0
+  remove_full_tunnel_rules firewalld
+  grep -q '^--permanent --zone=external --remove-interface=eth0$' "$calls"
+  grep -q '^--permanent --zone=external --remove-masquerade$' "$calls"
+  grep -q '^--reload$' "$calls"
+  ! grep -q -- '--remove-port' "$calls"
+}
+
+@test "reconfiguring full to hub preserves baseline firewall rules" {
+  require_root() { return 0; }
+  MODE=full
+  WAN=eth0
+  FIREWALL=iptables
+  SERVICE_BACKEND=systemd
+  write_metadata
+  mkdir -p "$WG_MANAGER_STATE_ROOT/clients/wg0"
+  printf 'AllowedIPs = 0.0.0.0/0\n' >"$WG_MANAGER_STATE_ROOT/clients/wg0/phone.conf"
+  MODE_ARG=hub
+  YES=1
+  add_firewall_rules() { [ "$MODE" = hub ]; }
+  remove_firewall_rules() { return 99; }
+  remove_full_tunnel_rules() { [ "$1" = iptables ]; }
+  install_service() { :; }
+  command_reconfigure
+  [ "$MODE" = hub ]
+  grep -q 'AllowedIPs = 10.7.0.0/24' "$WG_MANAGER_STATE_ROOT/clients/wg0/phone.conf"
+  grep -q '^MODE=hub$' "$WG_MANAGER_STATE_ROOT/interfaces/wg0/metadata"
+}
+
+@test "UFW setup errors are reported" {
+  ufw() { return 1; }
+  DRY_RUN=0
+  run add_firewall_rules ufw
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Could not allow UDP port"* ]]
+}
+
+@test "UFW NAT removal failure preserves its state mirror" {
+  local rules="$BATS_TEST_TMPDIR/before-fail.rules"
+  printf '# BEGIN wg-manager wg0\n*nat\nCOMMIT\n# END wg-manager wg0\n*filter\nCOMMIT\n' >"$rules"
+  export WG_MANAGER_UFW_RULES=$rules
+  printf 'managed nat\n' >"$WG_MANAGER_STATE_ROOT/interfaces/wg0/ufw-nat.rules"
+  ufw() { return 1; }
+  run remove_ufw_nat
+  [ "$status" -ne 0 ]
+  [ -f "$WG_MANAGER_STATE_ROOT/interfaces/wg0/ufw-nat.rules" ]
 }
 
 @test "ufw NAT block is inserted before the filter section and removed cleanly" {
