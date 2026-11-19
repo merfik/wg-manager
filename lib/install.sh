@@ -18,6 +18,9 @@ command_install() {
   route_conflict
   if [[ $MODE == full ]]; then
     WAN=$(detect_wan)
+    if [[ -z $WAN && -n $WAN_OVERRIDE ]]; then
+      WAN=$WAN_OVERRIDE
+    fi
     [[ -n $WAN ]] || die "No WAN interface was detected from the default route. Set an interface with route configuration or use --iface for the tunnel; WAN discovery requires network access."
     [[ -e "/sys/class/net/$WAN" ]] || die "Detected WAN interface '$WAN' is unavailable. Verify network configuration and re-run."
     if [[ $YES != 1 ]] && ! confirm "Use WAN interface '$WAN'?"; then

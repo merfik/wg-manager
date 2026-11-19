@@ -18,6 +18,8 @@ source "$WG_MANAGER_ROOT/lib/diagnostics.sh"
 source "$WG_MANAGER_ROOT/lib/maintenance.sh"
 # shellcheck source=lib/menu.sh
 source "$WG_MANAGER_ROOT/lib/menu.sh"
+# shellcheck source=lib/cli.sh
+source "$WG_MANAGER_ROOT/lib/cli.sh"
 # shellcheck source=lib/prepare.sh
 source "$WG_MANAGER_ROOT/lib/prepare.sh"
 

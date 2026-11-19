@@ -25,10 +25,12 @@ DRY_RUN="0"
 LOG_FILE=""
 COMMAND=""
 ARGS=()
+OUTPUT=""
 CLIENT=""
 QR=0
 SPLIT_TUNNEL=0
 ROUTES=""
+WAN_OVERRIDE=""
 MODE_ARG=""
 INSTALL_SUCCEEDED=0
 UNINSTALL_SUCCEEDED=0
@@ -51,10 +53,36 @@ Usage: wg-manager [--help] [--prepare] [--prepare-install]
 
 Run without arguments to open the interactive WireGuard installer and manager.
 
+CLI mode (non-interactive):
+  --install            Install a new interface (requires preset/values)
+  --add                Add a client (requires WG_CLIENT)
+  --remove             Remove a client (requires WG_CLIENT)
+  --list               List clients on the interface
+  --status             Show interface status
+  --doctor             Run diagnostics
+  --backup             Back up the interface
+  --restore            Restore from a backup (requires WG_BACKUP_FILE)
+  --uninstall          Uninstall the interface
+  --preset <file>      Load preset variables from a .env file
+  --iface <name>       Override the interface name
+  --dry-run            Preview without making changes
+  --yes | --auto       Auto-confirm all prompts
+
+Preset variables (wg-preset.env): WG_IFACE, WG_MODE, WG_ENDPOINT, WG_SUBNET,
+WG_PORT, WG_MTU, WG_KEEPALIVE, WG_IPV6, WG_DNS, WG_DNS_CUSTOM, WG_SPLIT_TUNNEL,
+WG_SPLIT_ROUTES, WG_WAN_IFACE, WG_CLIENT, WG_PSK, WG_EXPORT_DIR, WG_QR,
+WG_DRY_RUN, WG_BACKUP_FILE.
+
 Options:
   --help             Show this help and exit.
   --prepare          Check system requirements and show missing packages (no root required).
   --prepare-install  Check requirements and install missing required packages (requires root).
+
+Examples:
+  sudo ./wg-manager.sh --install --preset wg-preset.env
+  sudo ./wg-manager.sh --add --iface wg0 --preset wg-client-preset.env
+  sudo ./wg-manager.sh --list --iface wg0
+  sudo ./wg-manager.sh --install --preset wg-preset.env --dry-run
 EOF
 }
 require_root() {

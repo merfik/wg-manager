@@ -332,6 +332,13 @@ main_menu() {
 }
 
 main() {
+  cli_parse "$@" || true  # unknown/legacy flags fall through to the legacy path
+  if [[ -n $CLI_COMMAND ]]; then
+    cli_load_preset
+    cli_apply_flags
+    cli_dispatch
+    return $?
+  fi
   if (($#)); then
     if (($# == 1)) && [[ $1 == --help || $1 == -h ]]; then
       usage

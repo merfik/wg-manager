@@ -1,6 +1,6 @@
 # wg-manager
 
-`wg-manager` is an interactive Bash tool that sets up and manages WireGuard on a Linux server. You run it from a terminal with root access. It asks questions, then creates the configs, keys, firewall rules, and service settings for you.
+`wg-manager` is a Bash tool that sets up and manages WireGuard on a Linux server. You run it from a terminal with root access. It asks questions, then creates the configs, keys, firewall rules, and service settings for you. It can also run non-interactively with preset files — see section 4.
 
 ## 1. Overview
 
@@ -79,13 +79,13 @@ sudo ./wg-manager.sh --prepare-install
 
 The tool lists the packages it will install, asks `Proceed with installation? [y/N]`, uses the package manager for your distribution, and then checks again.
 
-### Step 3: Open the main menu
+### Step 3: Run the tool — CLI or menu
 
 ```bash
 sudo ./wg-manager.sh
 ```
 
-Only `--help`, `-h`, `--prepare`, and `--prepare-install` work as command-line options. Everything else is done in the menu. Old subcommands such as `install` or `list` are rejected.
+With no arguments, the interactive main menu opens. A non-interactive mode with preset files is documented in section 4. Only `--help`, `-h`, `--prepare`, `--prepare-install`, and the CLI commands from section 4 work as command-line options. Old subcommands such as `install` or `list` are rejected.
 
 ### Where the tool stores files
 
@@ -261,12 +261,90 @@ Answering `y` stops the service, removes the firewall rules, and deletes the ser
 
 Client configs, private keys, preshared keys, server keys, backups, and QR codes grant VPN access. The tool sets restrictive file permissions, but you should still store and share these files with care. The `show` action prints an explicit warning before displaying a config.
 
-## 4. Common errors and troubleshooting
+## 4. Non-interactive CLI mode
+
+`wg-manager.sh` can run without menus when you pass one of the command flags below. Prompts are disabled: missing values or invalid settings produce an error and a non-zero exit instead of a prompt.
+
+### 4.1 Command flags
+
+| Flag | Action | Notes |
+| --- | --- | --- |
+| `--install` | Install a new interface | Requires `WG_MODE` in the preset (`hub` or `full`). |
+| `--add` | Add a client | Requires `WG_CLIENT`; the interface must already be installed. |
+| `--remove` | Remove a client | Requires `WG_CLIENT`. |
+| `--list` | List clients on the interface | Read-only. |
+| `--status` | Show interface status | Read-only. |
+| `--doctor` | Run diagnostics | |
+| `--backup` | Back up the interface | |
+| `--restore` | Restore from a backup | Requires `WG_BACKUP_FILE`. |
+| `--uninstall` | Uninstall the interface | |
+| `--iface <name>` | Interface name | Overrides `WG_IFACE` from the preset. |
+| `--preset <file>` | Load a preset file | See section 4.2. |
+| `--dry-run` | Preview without making changes | |
+| `--yes` / `--auto` | Auto-confirm all prompts | |
+| `--help` / `-h` | Show usage | |
+
+There are no flags for individual settings such as mode, subnet, port, or endpoint; put those values in a preset file.
+
+### 4.2 Preset files
+
+Presets are `KEY=VALUE` files. `wg-preset.env` in the repository root is a ready-made template.
+
+| Variable | Used by | Meaning |
+| --- | --- | --- |
+| `WG_IFACE` | all commands | Interface name, default `wg0`. |
+| `WG_MODE` | `--install` | `hub` or `full`; required for `--install`. |
+| `WG_ENDPOINT` | `--install` | Public IP or hostname; required in hub mode. |
+| `WG_SUBNET` | `--install` | Tunnel subnet, default `10.7.0.0/24`. |
+| `WG_PORT` | `--install` | UDP port, default `51820`. |
+| `WG_MTU` | `--install` | Client MTU, default `1420`. |
+| `WG_KEEPALIVE` | `--install` | Persistent keepalive in seconds, default `25`. |
+| `WG_IPV6` | `--install` | Optional private IPv6 ULA CIDR, e.g. `fd00:7::/64`. |
+| `WG_DNS` | `--install` | `system` (default), `cloudflare`, `google`, `quad9`, `opendns`, or a custom address list. |
+| `WG_DNS_CUSTOM` | `--install` | Comma-separated IPv4 addresses, used when `WG_DNS=custom`. |
+| `WG_SPLIT_TUNNEL` | `--install` | Full mode only: `yes` to send only `WG_SPLIT_ROUTES` through the tunnel. |
+| `WG_SPLIT_ROUTES` | `--install` | Comma-separated CIDRs used when `WG_SPLIT_TUNNEL=yes`. |
+| `WG_WAN_IFACE` | `--install` | Full-tunnel WAN interface; auto-detected when blank. |
+| `WG_CLIENT` | `--add`, `--remove` | Client name, 1-32 characters. |
+| `WG_PSK` | `--add` | `yes` to generate a preshared key for the client. |
+| `WG_EXPORT_DIR` | `--add` | Directory for the exported client config after adding. |
+| `WG_QR` | show/export flows | `yes` to print QR codes where the action supports it. |
+| `WG_DRY_RUN` | all commands | `yes` to preview without making changes. |
+| `WG_BACKUP_FILE` | `--restore` | Backup archive path. |
+
+Example usage:
+
+```bash
+# Install from the preset template
+sudo ./wg-manager.sh --install --preset wg-preset.env
+
+# Install non-interactively with auto-confirm
+sudo ./wg-manager.sh --install --preset wg-preset.env --yes
+
+# Preview the install without changing anything
+sudo ./wg-manager.sh --install --preset wg-preset.env --dry-run
+
+# Add a client from a preset
+sudo ./wg-manager.sh --add --preset wg-client.env
+
+# List, status, and diagnostics (read-only, no root needed)
+./wg-manager.sh --list --iface wg0
+./wg-manager.sh --status --iface wg0
+./wg-manager.sh --doctor --iface wg0
+
+# Back up and restore
+sudo ./wg-manager.sh --backup --iface wg0 --preset wg-backup.env
+sudo ./wg-manager.sh --restore --preset wg-backup.env
+```
+
+Errors such as `WG_MODE is required in the preset (hub or full).` or `WG_CLIENT is required in the preset for --add.` tell you which preset value to set. Commands exit non-zero on failure.
+
+## 5. Common errors and troubleshooting
 
 | Message or symptom | What to do |
 | --- | --- |
-| `Root access is required. Re-run this command with sudo.` | Run the command with `sudo`. Only `--help`, `-h`, and `--prepare` work without root. |
-| `The command-line interface has been replaced by interactive menus. Run '<script-name>' without arguments.` | Use the menu. Only `--help`, `-h`, `--prepare`, and `--prepare-install` are accepted as options. |
+| `Root access is required. Re-run this command with sudo.` | Run the command with `sudo`. Only `--help`, `-h`, `--prepare`, and the read-only CLI commands (`--list`, `--status`, `--doctor`) work without root. |
+| `The command-line interface has been replaced by interactive menus. Run '<script-name>' without arguments.` | Use the menu or the CLI commands from section 4. Only `--help`, `-h`, `--prepare`, `--prepare-install`, and section 4 commands are accepted as options. |
 | `Unsupported distribution '<name>' for package installation.` | `--prepare-install` supports Debian, Ubuntu, Fedora, RHEL, Rocky, AlmaLinux, Arch, and Alpine. Install the packages from the `--prepare` table with your own package manager. |
 | `Package installation failed.` | Check your package manager output and network access. If the install list shows `ufw (recommended)`, install `ufw` manually and run `--prepare-install` again. |
 | `Interface '<name>' already has WireGuard or manager state. Choose another interface or manage the existing one.` | Pick a different interface name, or manage the existing one from the main menu. |
@@ -279,7 +357,7 @@ Client configs, private keys, preshared keys, server keys, backups, and QR codes
 | `Could not detect a public endpoint IP. Set --endpoint to a public hostname or IP.` | Enter the public IP or hostname at the `Public endpoint` prompt. The message names an old option; the menu prompt replaces it. Auto-detection also needs `curl`. |
 | `Missing WireGuard tools. Install 'wireguard-tools' and the WireGuard kernel module ...` | Install `wireguard-tools` and the kernel module (or `wireguard-go`), then retry. |
 | `No supported firewall backend is active or installed.` | Install and configure UFW, firewalld, or iptables before installing an interface. |
-| `Interface '<name>' failed to start and partial changes were rolled back. Run 'wg-manager doctor --iface <name>' ...` | Fix the service error first. The named doctor command is old text; open the interface menu and choose `7) Run diagnostics`. |
+| `Interface '<name>' failed to start and partial changes were rolled back. Run 'wg-manager doctor --iface <name>' ...` | Fix the service error first. Re-run `--doctor --iface <name>` or open the interface menu and choose `7) Run diagnostics`. |
 | `Client '<name>' already exists. Remove it before adding it again.` | Remove the client first, or use another name. |
 | `No tunnel addresses remain in '<subnet>'.` | Use a larger subnet at install time or remove a client to free an address. |
 | `Client '<name>' is not present on interface '<iface>'` or `has no config on interface '<iface>'` | Run `3) List clients` and check the name. Messages that say `wg-manager list --iface` are old text. |
@@ -302,4 +380,4 @@ Doctor report lines and what they mean:
 | `[WARN] MASQUERADE rule not found` | Shown in full-tunnel mode when the tool cannot find an iptables NAT rule. Review the firewall setup before treating it as an outage. |
 | `[FAIL] DNS resolution failed` | Check `/etc/resolv.conf` or the selected DNS provider. |
 
-Several error messages name options such as `--iface`, `--subnet`, `--mode`, or `--endpoint`. Those options are no longer accepted. Set the same values at the menu prompts.
+Several error messages name options. Use only the options from section 4 and `--help`, `-h`, `--prepare`, and `--prepare-install`. Other option names such as `--subnet`, `--mode`, or `--endpoint` are not accepted; set those values in the preset file or at the menu prompts.
