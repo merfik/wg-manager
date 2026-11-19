@@ -134,8 +134,7 @@ menu_prompt_client() {
   while true; do
     menu_read_value 'Client name (letters, digits, dot, underscore, hyphen)' '' || return 1
     CLIENT=$MENU_VALUE
-    if [[ $CLIENT =~ ^[A-Za-z0-9_.-]{1,32}$ ]]; then return 0; fi
-    log ERROR "Invalid client name '$CLIENT'. Use 1-32 letters, digits, dots, underscores, or hyphens."
+    if validate_client; then return 0; fi
   done
 }
 
@@ -216,6 +215,8 @@ menu_export_client() {
 
 menu_reconfigure() {
   menu_prompt_mode || return 0
+  MODE_ARG=$MODE
+  MODE=
   menu_run_with_dry_run command_reconfigure
 }
 

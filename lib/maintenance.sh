@@ -84,15 +84,66 @@ command_restore() {
     return 0
   fi
   tar -tzf "$file" >/dev/null 2>&1 || die "Backup '$file' is not a valid gzip tar archive. Create a new backup and re-run."
-  local metadata_file
-  metadata_file=$(tar -tzf "$file" | grep '/metadata$' | head -n1)
-  [[ -n $metadata_file ]] || die "Backup '$file' has no usable interface metadata. Restore it only after reviewing the archive."
-  IFACE=$(printf '%s' "$metadata_file" | sed -E 's|.*/interfaces/([^/]+)/metadata|\1|')
-  tar -xzf "$file" -C /
+  local -a members=()
+  mapfile -t members < <(tar -tzf "$file" 2>/dev/null)
+  ((${#members[@]} > 0)) || die "Backup '$file' is empty. Create a new backup and re-run."
+  local member
+  for member in "${members[@]}"; do
+    [[ $member == /* ]] && die "Backup '$file' contains an absolute path ('$member'). Refusing to restore it."
+    [[ /$member/ == */../* ]] && die "Backup '$file' contains a parent-directory reference ('$member'). Refusing to restore it."
+    [[ $member == *\\* ]] && die "Backup '$file' contains a backslash in a member name ('$member'). Refusing to restore it."
+  done
+  local listing entry
+  if listing=$(tar -tvzf "$file" 2>/dev/null); then :; else die "Backup '$file' cannot be listed. Create a new backup and re-run."; fi
+  while IFS= read -r entry; do
+    [[ -n $entry ]] || continue
+    [[ ${entry:0:1} == - || ${entry:0:1} == d ]] || die "Backup '$file' contains a non-regular member ('$entry'). Refusing to restore it."
+  done <<<"$listing"
+  local state_rel=${STATE_ROOT#/} etc_rel=${ETC_ROOT#/} sysctl_rel=${SYSCTL_DIR#/}
+  local metadata_member="" count=0
+  for member in "${members[@]}"; do
+    if [[ $member =~ ^$state_rel/interfaces/([^/]+)/metadata$ ]]; then
+      IFACE=${BASH_REMATCH[1]}
+      metadata_member=$member
+      count=$((count + 1))
+    fi
+  done
+  ((count == 1)) || die "Backup '$file' must contain exactly one interface metadata file. Found $count."
+  validate_iface || die "Backup '$file' names an invalid interface '$IFACE'."
+  local iface_rel="$state_rel/interfaces/$IFACE" clients_rel="$state_rel/clients/$IFACE"
+  for member in "${members[@]}"; do
+    case $member in
+      "$etc_rel/$IFACE.conf"|"$iface_rel"|"$iface_rel/"|"$iface_rel"/*|"$clients_rel"|"$clients_rel/"|"$clients_rel"/*|"$sysctl_rel/99-wg-manager-$IFACE.conf") ;;
+      *) die "Backup '$file' contains an unexpected path ('$member'). Refusing to restore it." ;;
+    esac
+  done
+  local stage
+  stage=$(mktemp -d)
+  trap 'rm -rf "$stage"' EXIT
+  tar -xzf "$file" -C "$stage" --no-same-owner --no-same-permissions || die "Extraction of '$file' failed."
+  install -d -m 700 "$ETC_ROOT" "$STATE_ROOT/interfaces/$IFACE" "$STATE_ROOT/clients/$IFACE"
+  install -m 600 "$stage/$etc_rel/$IFACE.conf" "$ETC_ROOT/$IFACE.conf"
+  local f
+  if [[ -d $stage/$iface_rel ]]; then
+    while IFS= read -r -d '' f; do
+      install -m 600 "$f" "$STATE_ROOT/interfaces/$IFACE/${f##*/}"
+    done < <(find "$stage/$iface_rel" -type f -print0)
+  fi
+  if [[ -d $stage/$clients_rel ]]; then
+    while IFS= read -r -d '' f; do
+      install -m 600 "$f" "$STATE_ROOT/clients/$IFACE/${f##*/}"
+    done < <(find "$stage/$clients_rel" -type f -print0)
+  fi
+  if [[ -f $stage/$sysctl_rel/99-wg-manager-$IFACE.conf ]]; then
+    install -m 600 "$stage/$sysctl_rel/99-wg-manager-$IFACE.conf" "$SYSCTL_DIR/99-wg-manager-$IFACE.conf"
+  fi
+  rm -f "$STATE_ROOT/interfaces/$IFACE/ufw-masq"
   read_metadata
   enable_forwarding
   add_firewall_rules "$FIREWALL"
   install_service start
+  rm -rf "$stage"
+  trap - EXIT
   log INFO "Restored WireGuard backup '$file' for '$IFACE'."
 }
 command_uninstall() {
@@ -117,6 +168,7 @@ command_uninstall() {
   fi
   install_service stop
   remove_firewall_rules "$FIREWALL"
+  remove_ufw_nat
   rm -f "$ETC_ROOT/$IFACE.conf" "$SYSCTL_DIR/99-wg-manager-$IFACE.conf"
   rm -rf "$(metadata_dir)" "$STATE_ROOT/clients/$IFACE"
   log INFO "Uninstalled $IFACE and removed its managed files and firewall rules."

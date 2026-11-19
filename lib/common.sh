@@ -63,6 +63,8 @@ CLI mode (non-interactive):
   --backup             Back up the interface
   --restore            Restore from a backup (requires WG_BACKUP_FILE)
   --uninstall          Uninstall the interface
+  --reconfigure        Switch an installed interface between hub and full mode
+  --mode <hub|full>    Target mode for --reconfigure
   --preset <file>      Load preset variables from a .env file
   --iface <name>       Override the interface name
   --dry-run            Preview without making changes
@@ -97,6 +99,12 @@ validate_iface() {
     return 1
   fi
 }
+validate_client() {
+  if [[ ! $CLIENT =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}$ ]]; then
+    log ERROR "Invalid client name '$CLIENT'. Use 1-32 letters, digits, dots, underscores, or hyphens, starting with a letter, digit, or underscore."
+    return 1
+  fi
+}
 validate_port() {
   if [[ ! $PORT =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
     log ERROR "Invalid listen port '$PORT'. Choose a port from 1 to 65535."
@@ -117,22 +125,9 @@ validate_keepalive() {
 }
 validate_cidr() {
   local cidr=$1
-  if [[ ! $cidr =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]]; then
+  local octet='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
+  if [[ ! $cidr =~ ^$octet(\.$octet){3}/(0|[12]?[0-9]|3[0-2])$ ]]; then
     log ERROR "Invalid CIDR '$cidr'. Use IPv4 notation such as 10.7.0.0/24."
-    return 1
-  fi
-  local ip=${cidr%/*} prefix=${cidr#*/}
-  local -a octets
-  IFS=. read -r -a octets <<<"$ip"
-  local octet
-  for octet in "${octets[@]}"; do
-    if (( octet > 255 )); then
-      log ERROR "Invalid CIDR '$cidr'. An IPv4 octet must be from 0 to 255."
-      return 1
-    fi
-  done
-  if (( prefix < 0 || prefix > 32 )); then
-    log ERROR "Invalid CIDR '$cidr'. Prefix length must be 0-32."
     return 1
   fi
 }
@@ -195,27 +190,6 @@ confirm() {
   read -r -p "$prompt [y/N] " reply
   [[ ${reply,,} == y || ${reply,,} == yes ]]
 }
-check_system_requirements() {
-  local uid=${1:-$EUID}
-  local command_name
-  local -a missing=()
-  require_root "$uid"
-  distro_detect
-  for command_name in awk cat chmod date find getent grep head install \
-    ip mkdir paste python3 rm sed ss sysctl tar wg wg-quick; do
-    command_available "$command_name" || missing+=("$command_name")
-  done
-  if [[ $SERVICE_BACKEND == none ]]; then
-    missing+=("systemd or OpenRC service manager")
-  fi
-  if ((${#missing[@]} > 0)); then
-    log ERROR "Missing required system commands or services: ${missing[*]}. Install the corresponding packages (see README.md), then run wg-manager again."
-    return 1
-  fi
-  if [[ $(detect_firewall) == none ]]; then
-    log WARN "No supported firewall backend is active or installed. Install and configure UFW, firewalld, or iptables before installing an interface."
-  fi
-}
 distro_detect() {
   if [[ -r /etc/os-release ]]; then
     # shellcheck disable=SC1091
@@ -246,6 +220,31 @@ detect_firewall() {
     echo none
   fi
 }
+ufw_rules_file() {
+  printf '%s\n' "${WG_MANAGER_UFW_RULES:-/etc/ufw/before.rules}"
+}
+# Metadata and preset files are parsed, never sourced. Each line is split on the
+# first '=' and the value is taken literally. An inline comment is stripped only
+# when the '#' is preceded by whitespace, so values may contain '#'.
+declare -gA KV=()
+parse_kv_file() {
+  local file=$1 line key value
+  KV=()
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    [[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+    [[ $line =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]] || return 1
+    key=${BASH_REMATCH[1]}
+    value=${BASH_REMATCH[2]}
+    value=${value%%[[:space:]]#*}
+    value=${value#"${value%%[![:space:]]*}"}
+    value=${value%"${value##*[![:space:]]}"}
+    if [[ ${#value} -ge 2 ]] && [[ $value == \"*\" || $value == \'*\' ]]; then
+      value=${value:1:${#value}-2}
+    fi
+    KV[$key]=$value
+  done <"$file"
+}
 metadata_dir() {
   printf '%s/interfaces/%s\n' "$STATE_ROOT" "$IFACE"
 }
@@ -258,44 +257,75 @@ ensure_state_dirs() {
   install -d -m 700 "$ETC_ROOT"
 }
 read_metadata() {
-  local file
+  local file key
   file=$(metadata_file)
   [[ -f $file ]] || die "Interface '$IFACE' is not managed by wg-manager. Check its name or run install first."
-  # shellcheck disable=SC1090
-  source "$file"
-  MODE=${MODE:-}
-  SUBNET=${SUBNET:-}
-  IPV6=${IPV6:-}
-  PORT=${PORT:-}
-  ENDPOINT=${ENDPOINT:-}
-  DNS=${DNS:-}
-  MTU=${MTU:-1420}
-  KEEPALIVE=${KEEPALIVE:-25}
-  WAN=${WAN:-}
-  FIREWALL=${FIREWALL:-}
-  SERVICE_BACKEND=${SERVICE_BACKEND:-}
+  parse_kv_file "$file" || die "Metadata for '$IFACE' at $file is malformed. Reinstall the interface or restore a valid backup."
+  for key in "${!KV[@]}"; do
+    case $key in
+      MODE|IFACE|SUBNET|IPV6|PORT|ENDPOINT|DNS|MTU|KEEPALIVE|WAN|FIREWALL|SERVICE_BACKEND|SPLIT_TUNNEL|ROUTES|PSK|CREATED_AT) ;;
+      *) die "Metadata for '$IFACE' contains an unexpected key '$key'. Refusing to load it." ;;
+    esac
+  done
+  if [[ -n ${KV[IFACE]:-} && ${KV[IFACE]} != "$IFACE" ]]; then
+    die "Metadata for '$IFACE' names interface '${KV[IFACE]}'. Refusing to load mismatched state."
+  fi
+  validate_iface || die "Metadata for '$IFACE' contains an invalid interface name."
+  MODE=${KV[MODE]:-}
+  SUBNET=${KV[SUBNET]:-}
+  IPV6=${KV[IPV6]:-}
+  PORT=${KV[PORT]:-}
+  ENDPOINT=${KV[ENDPOINT]:-}
+  DNS=${KV[DNS]:-}
+  MTU=${KV[MTU]:-1420}
+  KEEPALIVE=${KV[KEEPALIVE]:-25}
+  WAN=${KV[WAN]:-}
+  FIREWALL=${KV[FIREWALL]:-}
+  SERVICE_BACKEND=${KV[SERVICE_BACKEND]:-}
+  SPLIT_TUNNEL=${KV[SPLIT_TUNNEL]:-0}
+  ROUTES=${KV[ROUTES]:-}
+  PSK=${KV[PSK]:-0}
 }
 write_metadata() {
-  local dir file
+  local dir file tmp name value
   dir=$(metadata_dir)
   file=$(metadata_file)
   install -d -m 700 "$dir"
-  cat >"$file" <<EOF
-MODE=$MODE
-IFACE=$IFACE
-SUBNET=$SUBNET
-IPV6=$IPV6
-PORT=$PORT
-ENDPOINT=$ENDPOINT
-DNS=$DNS
-MTU=$MTU
-KEEPALIVE=$KEEPALIVE
-WAN=${WAN:-}
-FIREWALL=${FIREWALL:-}
-SERVICE_BACKEND=${SERVICE_BACKEND:-}
-CREATED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-EOF
-  chmod 600 "$file"
+  local -A values=(
+    [MODE]=$MODE
+    [IFACE]=$IFACE
+    [SUBNET]=$SUBNET
+    [IPV6]=$IPV6
+    [PORT]=$PORT
+    [ENDPOINT]=$ENDPOINT
+    [DNS]=$DNS
+    [MTU]=$MTU
+    [KEEPALIVE]=$KEEPALIVE
+    [WAN]=${WAN:-}
+    [FIREWALL]=${FIREWALL:-}
+    [SERVICE_BACKEND]=${SERVICE_BACKEND:-}
+    [SPLIT_TUNNEL]=${SPLIT_TUNNEL:-0}
+    [ROUTES]=${ROUTES:-}
+    [PSK]=${PSK:-0}
+  )
+  for name in "${!values[@]}"; do
+    value=${values[$name]}
+    if [[ $value == *$'\n'* ]]; then
+      die "Refusing to write metadata for '$IFACE': '$name' contains a newline."
+    fi
+  done
+  tmp=$(mktemp "$dir/.metadata.XXXXXX")
+  (
+    umask 077
+    {
+      for name in MODE IFACE SUBNET IPV6 PORT ENDPOINT DNS MTU KEEPALIVE WAN FIREWALL SERVICE_BACKEND SPLIT_TUNNEL ROUTES PSK; do
+        printf '%s=%s\n' "$name" "${values[$name]}"
+      done
+      printf 'CREATED_AT=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    } >"$tmp"
+  )
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$file"
 }
 
 # Package database: command -> distro -> package name

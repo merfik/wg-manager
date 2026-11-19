@@ -18,30 +18,31 @@ EOF
 }
 route_conflict() {
   validate_cidr "$SUBNET"
-  local network
+  local network dest
   network=$(python3 - "$SUBNET" <<'PY'
 import ipaddress, sys
 network = ipaddress.IPv4Network(sys.argv[1], strict=False)
 print(str(network))
 PY
   )
-  while read -r route iface rest; do
-    [[ -n ${route:-} && $route != "$network" ]] || continue
-    if python3 - "$route" "$network" <<'PY' >/dev/null 2>&1
+  while read -r dest _rest; do
+    [[ -n $dest && $dest != "$network" && $dest != default ]] || continue
+    if python3 - "$dest" "$network" <<'PY' >/dev/null 2>&1
 import ipaddress, sys
 a=ipaddress.IPv4Network(sys.argv[1], strict=False)
 b=ipaddress.IPv4Network(sys.argv[2], strict=False)
 raise SystemExit(0 if a.overlaps(b) else 1)
 PY
     then
-      die "The tunnel subnet '$network' overlaps existing route '$route' on '$iface'. Choose another --subnet or remove the conflicting route."
+      die "The tunnel subnet '$network' overlaps existing route '$dest'. Choose another subnet or remove the conflicting route."
     fi
-  done < <(ip -4 route show 2>/dev/null | awk '{print $1 " " $3}')
+  done < <(ip -4 route show 2>/dev/null | awk '{print $1}')
 }
 detect_endpoint() {
   [[ -n $ENDPOINT ]] && return 0
-  ENDPOINT=$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)
-  [[ -n $ENDPOINT ]] || die "Could not detect a public endpoint IP. Set --endpoint to a public hostname or IP."
+  local rc=0
+  ENDPOINT=$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null) || rc=$?
+  [[ -n $ENDPOINT ]] || die "Could not detect a public endpoint IP (curl exit $rc). Enter the public IP or hostname at the prompt, or install/repair curl and check proxy settings."
   validate_endpoint
   log INFO "Detected public endpoint $ENDPOINT. Verify it in the setup confirmation."
 }
@@ -85,18 +86,22 @@ EOF
 allocate_client_ip() {
   python3 - "$SUBNET" "$ETC_ROOT/$IFACE.conf" <<'PY'
 import ipaddress, sys
-network=ipaddress.IPv4Network(sys.argv[1], strict=False)
-used=set()
-path=sys.argv[2]
+network = ipaddress.IPv4Network(sys.argv[1], strict=False)
+used = set()
 try:
-    for line in open(path, encoding="utf-8"):
-        line=line.strip()
-        if line.startswith("Address="):
-            used.add(ipaddress.IPv4Address(line.split("=",1)[1].split("/",1)[0]))
+    for line in open(sys.argv[2], encoding="utf-8"):
+        key, _, val = line.partition("=")
+        if key.strip() not in ("Address", "AllowedIPs"):
+            continue
+        for item in val.split(","):
+            try:
+                used.add(ipaddress.IPv4Address(item.strip().split("/")[0]))
+            except ValueError:
+                pass
 except FileNotFoundError:
     pass
 for addr in network.hosts():
-    if addr != network.network_address and addr not in used:
+    if addr not in used:
         print(f"{addr}/{network.prefixlen}")
         break
 PY
@@ -134,22 +139,124 @@ AllowedIPs = $allowed
 PersistentKeepalive = $KEEPALIVE
 EOF
 }
+ufw_nat_file() {
+  printf '%s/interfaces/%s/ufw-nat.rules\n' "$STATE_ROOT" "$IFACE"
+}
+ufw_nat_block() {
+  local wan=$1
+  printf '# BEGIN wg-manager %s\n' "$IFACE"
+  printf '*nat\n'
+  printf ':POSTROUTING ACCEPT [0:0]\n'
+  printf -- '-A POSTROUTING -o %s -j MASQUERADE\n' "$wan"
+  printf 'COMMIT\n'
+  printf '# END wg-manager %s\n' "$IFACE"
+}
+ufw_nat_remove_block() {
+  local rules_file=$1
+  python3 - "$rules_file" "$IFACE" <<'PY' || return 1
+import os, sys, tempfile
+rules, iface = sys.argv[1:3]
+begin = f"# BEGIN wg-manager {iface}"
+end = f"# END wg-manager {iface}"
+lines = open(rules, encoding="utf-8").read().splitlines(keepends=True)
+out, skipping, changed = [], False, False
+for line in lines:
+    stripped = line.strip()
+    if stripped == begin:
+        skipping = True
+        changed = True
+        continue
+    if skipping:
+        if stripped == end:
+            skipping = False
+        continue
+    out.append(line)
+if skipping:
+    raise SystemExit(f"unterminated {begin} block in {rules}")
+if not changed:
+    raise SystemExit(0)
+mode = os.stat(rules).st_mode & 0o777
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(rules) or ".")
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    f.writelines(out)
+os.chmod(tmp, mode)
+os.replace(tmp, rules)
+PY
+}
+apply_ufw_nat() {
+  local wan=${1:-${WAN:-}} rules_file state tmp
+  rules_file=$(ufw_rules_file)
+  [[ -n $wan ]] || die "Cannot apply NAT rules for '$IFACE': no WAN interface is recorded."
+  state=$(ufw_nat_file)
+  if [[ $DRY_RUN == 1 ]]; then
+    printf 'Would add NAT rules for %s to %s:\n' "$wan" "$rules_file"
+    ufw_nat_block "$wan"
+    return 0
+  fi
+  install -d -m 700 "$(dirname "$state")"
+  tmp=$(mktemp "$(dirname "$state")/.ufw-nat.XXXXXX")
+  ufw_nat_block "$wan" >"$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$state"
+  python3 - "$rules_file" "$IFACE" "$state" <<'PY' || die "Could not update $rules_file for '$IFACE'. Check the file layout and re-run."
+import os, sys, tempfile
+rules, iface, block_path = sys.argv[1:4]
+begin = f"# BEGIN wg-manager {iface}"
+end = f"# END wg-manager {iface}"
+block = open(block_path, encoding="utf-8").read()
+lines = open(rules, encoding="utf-8").read().splitlines(keepends=True)
+out, skipping = [], False
+for line in lines:
+    stripped = line.strip()
+    if stripped == begin:
+        skipping = True
+        continue
+    if skipping:
+        if stripped == end:
+            skipping = False
+        continue
+    out.append(line)
+if skipping:
+    raise SystemExit(f"unterminated {begin} block in {rules}")
+insert_at = next((i for i, l in enumerate(out) if l.strip() == "*filter"), None)
+if insert_at is None:
+    raise SystemExit(f"no *filter section in {rules}")
+if insert_at > 0 and not out[insert_at - 1].endswith("\n"):
+    out[insert_at - 1] += "\n"
+out.insert(insert_at, block)
+mode = os.stat(rules).st_mode & 0o777
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(rules) or ".")
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    f.writelines(out)
+os.chmod(tmp, mode)
+os.replace(tmp, rules)
+PY
+  ufw --force reload >/dev/null || die "ufw reload failed after adding NAT rules for '$IFACE'."
+  iptables -t nat -S POSTROUTING 2>/dev/null | grep -q -- "-o $wan -j MASQUERADE" ||
+    die "NAT rule for '$IFACE' is not active after ufw reload. Inspect $rules_file."
+}
+remove_ufw_nat() {
+  local rules_file state
+  rules_file=$(ufw_rules_file)
+  state=$(ufw_nat_file)
+  if [[ $DRY_RUN == 1 ]]; then
+    printf 'Would remove NAT rules for %s from %s\n' "$IFACE" "$rules_file"
+    return 0
+  fi
+  if [[ -f $rules_file ]] && grep -q -- "# BEGIN wg-manager $IFACE" "$rules_file"; then
+    ufw_nat_remove_block "$rules_file" || log WARN "Could not remove the NAT block for '$IFACE' from $rules_file."
+    ufw --force reload >/dev/null 2>&1 || log WARN "ufw reload failed while removing NAT rules for '$IFACE'."
+  fi
+  rm -f "$state" "$(metadata_dir)/ufw-masq"
+}
 add_firewall_rules() {
   local firewall=$1
   case "$firewall" in
     ufw)
       [[ $DRY_RUN == 1 ]] || ufw allow "$PORT"/udp >/dev/null
       if [[ $MODE == full ]]; then
-        [[ $DRY_RUN == 1 ]] || {
-          ufw route allow in on "$IFACE" out on "$WAN" >/dev/null
-          python3 - "$WAN" "$STATE_ROOT/interfaces/$IFACE/ufw-masq" <<'PY'
-import sys
-from pathlib import Path
-wan=sys.argv[1]; state=Path(sys.argv[2])
-text=f"*nat\n-A POSTROUTING -o {wan} -j MASQUERADE\nCOMMIT\n"
-state.write_text(text)
-PY
-        }
+        [[ $DRY_RUN == 1 ]] || ufw route allow in on "$IFACE" out on "$WAN" >/dev/null
+        apply_ufw_nat "$WAN"
       fi
       ;;
     firewalld)
@@ -183,6 +290,7 @@ remove_firewall_rules() {
     ufw)
       ufw delete allow "$PORT"/udp >/dev/null 2>&1 || true
       ufw route delete allow in on "$IFACE" out on "$WAN" >/dev/null 2>&1 || true
+      remove_ufw_nat
       ;;
     firewalld)
       firewall-cmd --permanent --remove-port="$PORT"/udp >/dev/null 2>&1 || true

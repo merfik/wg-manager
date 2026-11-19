@@ -50,13 +50,55 @@ command_doctor() {
     fail=1
   fi
   printf '  [info] active firewall backend: %s\n' "$(detect_firewall)"
-  if [[ $MODE == full ]]; then
-    if iptables -t nat -S POSTROUTING 2>/dev/null | grep -q "MASQUERADE.*-o $WAN"; then
-      printf '  [ok] full-tunnel MASQUERADE rule is present\n'
+  local -a peer_ips=() dupes=() non32=()
+  local peer_entry host
+  local -A seen=()
+  while IFS= read -r peer_entry; do
+    [[ -n $peer_entry ]] || continue
+    host=${peer_entry%%/*}
+    if [[ -n ${seen[$host]:-} ]]; then
+      dupes+=("$host")
     else
-      printf '  [WARN] MASQUERADE rule not found: rerun reconfigure --mode full or review firewall setup\n'
-      fail=1
+      seen[$host]=1
     fi
+    [[ ${peer_entry#*/} == 32 ]] || non32+=("$peer_entry")
+  done < <(awk '/^[[:space:]]*\[Peer\]/{p=1;next} /^[[:space:]]*\[/{p=0} p && /^[[:space:]]*AllowedIPs[[:space:]]*=/{split($0,a,"="); n=split(a[2],b,","); for(i=1;i<=n;i++){gsub(/[[:space:]]/,"",b[i]); print b[i]}}' "$ETC_ROOT/$IFACE.conf" 2>/dev/null)
+  if ((${#dupes[@]} > 0)); then
+    printf '  [FAIL] clients share tunnel address %s: remove and re-add the affected clients\n' "${dupes[*]}"
+    fail=1
+  fi
+  if ((${#non32[@]} > 0)); then
+    printf '  [FAIL] peer AllowedIPs %s must be /32: remove and re-add the affected clients\n' "${non32[*]}"
+    fail=1
+  fi
+  if [[ $MODE == full ]]; then
+    case $(detect_firewall) in
+      ufw)
+        if grep -q -- "# BEGIN wg-manager $IFACE" "$(ufw_rules_file)" 2>/dev/null &&
+          iptables -t nat -S POSTROUTING 2>/dev/null | grep -q -- "-o $WAN -j MASQUERADE"; then
+          printf '  [ok] full-tunnel NAT rule is present in %s\n' "$(ufw_rules_file)"
+        else
+          printf '  [FAIL] full-tunnel NAT rule is missing: rerun reconfigure --mode full or review %s\n' "$(ufw_rules_file)"
+          fail=1
+        fi
+        ;;
+      firewalld)
+        if firewall-cmd --zone=external --query-masquerade >/dev/null 2>&1; then
+          printf '  [ok] full-tunnel masquerade is enabled for the external zone\n'
+        else
+          printf '  [FAIL] full-tunnel masquerade is not enabled: rerun reconfigure --mode full or review firewalld\n'
+          fail=1
+        fi
+        ;;
+      *)
+        if iptables -t nat -S POSTROUTING 2>/dev/null | grep -q "MASQUERADE.*-o $WAN"; then
+          printf '  [ok] full-tunnel MASQUERADE rule is present\n'
+        else
+          printf '  [WARN] MASQUERADE rule not found: rerun reconfigure --mode full or review firewall setup\n'
+          fail=1
+        fi
+        ;;
+    esac
   fi
   if getent hosts example.com >/dev/null 2>&1; then
     printf '  [ok] DNS resolution works\n'

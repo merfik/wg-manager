@@ -243,3 +243,252 @@ setup() {
   [ "$(get_pkg_name python3 arch)" = "python" ]
   [ "$(get_pkg_name sysctl arch)" = "procps-ng" ]
 }
+
+@test "metadata is parsed, never executed" {
+  local marker="$BATS_TEST_TMPDIR/pwned"
+  printf 'MODE=hub\nEVIL=$(touch %s)\n' "$marker" >"$BATS_TEST_TMPDIR/state/interfaces/wg0/metadata"
+  run read_metadata
+  [ "$status" -ne 0 ]
+  [ ! -e "$marker" ]
+  [[ "$output" == *"unexpected key 'EVIL'"* ]]
+
+  printf 'MODE=hub\nSUBNET=$(touch %s)\n' "$marker" >"$BATS_TEST_TMPDIR/state/interfaces/wg0/metadata"
+  run read_metadata
+  [ "$status" -eq 0 ]
+  [ ! -e "$marker" ]
+  read_metadata
+  [ "$SUBNET" = '$(touch '"$marker"')' ]
+}
+
+@test "metadata rejects an unexpected interface name" {
+  printf 'IFACE=wg9\nMODE=hub\n' >"$BATS_TEST_TMPDIR/state/interfaces/wg0/metadata"
+  run read_metadata
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"names interface 'wg9'"* ]]
+}
+
+@test "metadata round-trips split-tunnel settings and leaves no temp files" {
+  MODE=full
+  WAN=eth0
+  FIREWALL=ufw
+  SERVICE_BACKEND=systemd
+  SPLIT_TUNNEL=1
+  ROUTES=192.168.50.0/24,192.168.60.0/24
+  write_metadata
+  MODE=
+  ROUTES=
+  SPLIT_TUNNEL=0
+  read_metadata
+  [ "$SPLIT_TUNNEL" = 1 ]
+  [ "$ROUTES" = "192.168.50.0/24,192.168.60.0/24" ]
+  [ "$(stat -c %a "$BATS_TEST_TMPDIR/state/interfaces/wg0/metadata")" = 600 ]
+  local leftovers=("$BATS_TEST_TMPDIR"/state/interfaces/wg0/.metadata.*)
+  [ ! -e "${leftovers[0]}" ]
+}
+
+@test "preset files are parsed without executing values" {
+  local preset="$BATS_TEST_TMPDIR/preset.env" marker="$BATS_TEST_TMPDIR/pwned"
+  {
+    printf '# comment line\n'
+    printf 'WG_IFACE=wg5   # inline comment\n'
+    printf 'WG_MODE="full"\n'
+    printf 'WG_IPV6=        # empty\n'
+    printf 'WG_WAN_IFACE=$(touch %s)\n' "$marker"
+    printf 'WG_UNKNOWN=1\n'
+    printf 'OTHER=2\n'
+  } >"$preset"
+  cli_parse --install --preset "$preset"
+  cli_load_preset >"$BATS_TEST_TMPDIR/preset.out" 2>&1
+  [ "$IFACE" = wg5 ]
+  [ "$MODE" = full ]
+  [ -z "$IPV6" ]
+  [ "$WAN_OVERRIDE" = '$(touch '"$marker"')' ]
+  [ ! -e "$marker" ]
+  grep -q "Ignoring unknown preset variable 'WG_UNKNOWN'" "$BATS_TEST_TMPDIR/preset.out"
+  grep -q "Ignoring non-WG variable 'OTHER'" "$BATS_TEST_TMPDIR/preset.out"
+}
+
+@test "preset client names are validated" {
+  local preset="$BATS_TEST_TMPDIR/bad-client.env"
+  printf 'WG_CLIENT=../evil\n' >"$preset"
+  cli_parse --add --preset "$preset"
+  run cli_load_preset
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Invalid client name"* ]]
+}
+
+@test "CIDR validation rejects leading zeros and out-of-range octets" {
+  run validate_cidr 10.7.0.0/24
+  [ "$status" -eq 0 ]
+  run validate_cidr 10.7.0.0/0
+  [ "$status" -eq 0 ]
+  run validate_cidr 10.001.002.003/24
+  [ "$status" -ne 0 ]
+  run validate_cidr 999.7.0.0/24
+  [ "$status" -ne 0 ]
+  run validate_cidr 10.7.0.0/33
+  [ "$status" -ne 0 ]
+}
+
+@test "client names are validated" {
+  CLIENT=phone-1
+  run validate_client
+  [ "$status" -eq 0 ]
+  CLIENT=../evil
+  run validate_client
+  [ "$status" -ne 0 ]
+  CLIENT=.hidden
+  run validate_client
+  [ "$status" -ne 0 ]
+}
+
+@test "client addresses do not collide with the server or existing peers" {
+  printf '[Interface]\nAddress = 10.7.0.1/24\n\n[Peer]\nPublicKey = x\nAllowedIPs = 10.7.0.2/32\n' >"$WG_MANAGER_ETC_ROOT/wg0.conf"
+  [ "$(allocate_client_ip)" = "10.7.0.3/24" ]
+}
+
+@test "adding a client writes a /32 peer and rolls back when syncconf fails" {
+  require_root() { return 0; }
+  distro_detect() { DISTRO=debian; SERVICE_BACKEND=systemd; }
+  generate_psk() { printf ''; }
+  ip() { return 0; }
+  wg() {
+    case "$1" in
+      genkey) printf 'PRIVATEKEY\n' ;;
+      pubkey) cat >/dev/null; printf 'PUBLICKEY\n' ;;
+      syncconf) printf 'boom\n' >&2; return 1 ;;
+    esac
+  }
+  wg-quick() { printf '[Interface]\n'; }
+  MODE=hub
+  WAN=eth0
+  FIREWALL=iptables
+  SERVICE_BACKEND=systemd
+  ENDPOINT=192.0.2.10
+  write_metadata
+  printf '[Interface]\nAddress = 10.7.0.1/24\nPrivateKey = k\nListenPort = 51820\n' >"$WG_MANAGER_ETC_ROOT/wg0.conf"
+  CLIENT=phone
+  run command_add
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"rolled back"* ]]
+  run grep -q '\[Peer\]' "$WG_MANAGER_ETC_ROOT/wg0.conf"
+  [ "$status" -ne 0 ]
+  [ ! -e "$WG_MANAGER_STATE_ROOT/clients/wg0/phone.conf" ]
+  [ ! -e "$WG_MANAGER_STATE_ROOT/clients/wg0/phone.private" ]
+
+  wg() {
+    case "$1" in
+      genkey) printf 'PRIVATEKEY\n' ;;
+      pubkey) cat >/dev/null; printf 'PUBLICKEY\n' ;;
+      syncconf) return 0 ;;
+    esac
+  }
+  run command_add
+  [ "$status" -eq 0 ]
+  grep -q -- 'AllowedIPs = 10.7.0.2/32' "$WG_MANAGER_ETC_ROOT/wg0.conf"
+  grep -q -- 'Address = 10.7.0.2/24' "$WG_MANAGER_STATE_ROOT/clients/wg0/phone.conf"
+}
+
+@test "removing a client handles CRLF configs" {
+  require_root() { return 0; }
+  distro_detect() { DISTRO=debian; SERVICE_BACKEND=systemd; }
+  ip() { return 0; }
+  wg() { return 0; }
+  wg-quick() { printf 'stripped\n'; }
+  MODE=hub
+  WAN=eth0
+  FIREWALL=iptables
+  SERVICE_BACKEND=systemd
+  ENDPOINT=192.0.2.10
+  write_metadata
+  printf '[Interface]\r\nAddress = 10.7.0.1/24\r\n\r\n[Peer]\r\n# phone\r\nPublicKey = KEYA\r\nAllowedIPs = 10.7.0.2/32\r\n\r\n[Peer]\r\n# laptop\r\nPublicKey = KEYB\r\nAllowedIPs = 10.7.0.3/32\r\n' >"$WG_MANAGER_ETC_ROOT/wg0.conf"
+  printf 'KEYA\n' >"$WG_MANAGER_STATE_ROOT/clients/wg0/phone.public"
+  printf 'conf\n' >"$WG_MANAGER_STATE_ROOT/clients/wg0/phone.conf"
+  CLIENT=phone
+  YES=1
+  run command_remove
+  [ "$status" -eq 0 ]
+  run grep -q KEYB "$WG_MANAGER_ETC_ROOT/wg0.conf"
+  [ "$status" -eq 0 ]
+  run grep -q KEYA "$WG_MANAGER_ETC_ROOT/wg0.conf"
+  [ "$status" -ne 0 ]
+  [ ! -e "$WG_MANAGER_STATE_ROOT/clients/wg0/phone.conf" ]
+}
+
+@test "restore rejects archives with unexpected members" {
+  require_root() { return 0; }
+  local stage="$BATS_TEST_TMPDIR/tar"
+  mkdir -p "$stage/${WG_MANAGER_STATE_ROOT#/}/interfaces/wg0" "$stage/etc"
+  printf 'MODE=hub\n' >"$stage/${WG_MANAGER_STATE_ROOT#/}/interfaces/wg0/metadata"
+  printf 'x\n' >"$stage/etc/passwd"
+  tar -czf "$BATS_TEST_TMPDIR/bad.tar.gz" -C "$stage" etc/passwd "${WG_MANAGER_STATE_ROOT#/}/interfaces/wg0/metadata"
+  ARGS=("$BATS_TEST_TMPDIR/bad.tar.gz")
+  YES=1
+  run command_restore
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"unexpected path"* ]]
+}
+
+@test "restore rejects archives with symlink members" {
+  require_root() { return 0; }
+  local stage="$BATS_TEST_TMPDIR/tar2"
+  mkdir -p "$stage/${WG_MANAGER_STATE_ROOT#/}/interfaces/wg0"
+  printf 'MODE=hub\n' >"$stage/${WG_MANAGER_STATE_ROOT#/}/interfaces/wg0/metadata"
+  ln -s /etc/passwd "$stage/${WG_MANAGER_STATE_ROOT#/}/interfaces/wg0/evil"
+  tar -czf "$BATS_TEST_TMPDIR/link.tar.gz" -C "$stage" "${WG_MANAGER_STATE_ROOT#/}/interfaces/wg0/metadata" "${WG_MANAGER_STATE_ROOT#/}/interfaces/wg0/evil"
+  ARGS=("$BATS_TEST_TMPDIR/link.tar.gz")
+  YES=1
+  run command_restore
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"non-regular member"* ]]
+}
+
+@test "restore installs a valid archive into the managed roots" {
+  require_root() { return 0; }
+  enable_forwarding() { :; }
+  add_firewall_rules() { :; }
+  install_service() { :; }
+  local stage="$BATS_TEST_TMPDIR/good"
+  mkdir -p "$stage/${WG_MANAGER_STATE_ROOT#/}/interfaces/wg0" "$stage/${WG_MANAGER_ETC_ROOT#/}" "$stage/${WG_MANAGER_SYSCTL_DIR#/}"
+  printf 'MODE=hub\nIFACE=wg0\nSUBNET=10.7.0.0/24\nIPV6=\nPORT=51820\nENDPOINT=192.0.2.10\nDNS=system\nMTU=1420\nKEEPALIVE=25\nWAN=eth0\nFIREWALL=iptables\nSERVICE_BACKEND=systemd\nSPLIT_TUNNEL=0\nROUTES=\nPSK=0\nCREATED_AT=2026-01-01T00:00:00Z\n' >"$stage/${WG_MANAGER_STATE_ROOT#/}/interfaces/wg0/metadata"
+  printf '[Interface]\nAddress = 10.7.0.1/24\nPrivateKey = k\nListenPort = 51820\n' >"$stage/${WG_MANAGER_ETC_ROOT#/}/wg0.conf"
+  printf 'net.ipv4.ip_forward=1\n' >"$stage/${WG_MANAGER_SYSCTL_DIR#/}/99-wg-manager-wg0.conf"
+  tar -czf "$BATS_TEST_TMPDIR/good.tar.gz" -C "$stage" \
+    "${WG_MANAGER_STATE_ROOT#/}/interfaces/wg0/metadata" \
+    "${WG_MANAGER_ETC_ROOT#/}/wg0.conf" \
+    "${WG_MANAGER_SYSCTL_DIR#/}/99-wg-manager-wg0.conf"
+  ARGS=("$BATS_TEST_TMPDIR/good.tar.gz")
+  YES=1
+  MODE=
+  SUBNET=
+  command_restore
+  [ "$MODE" = hub ]
+  [ "$SUBNET" = 10.7.0.0/24 ]
+  grep -q 'ListenPort = 51820' "$WG_MANAGER_ETC_ROOT/wg0.conf"
+  grep -q 'net.ipv4.ip_forward=1' "$WG_MANAGER_SYSCTL_DIR/99-wg-manager-wg0.conf"
+}
+
+@test "ufw NAT block is inserted before the filter section and removed cleanly" {
+  local rules="$BATS_TEST_TMPDIR/before.rules" orig_mode
+  printf '*filter\n:ufw-before-input - [0:0]\nCOMMIT\n' >"$rules"
+  orig_mode=$(stat -c %a "$rules")
+  export WG_MANAGER_UFW_RULES=$rules
+  WAN=eth0
+  IFACE=wg0
+  MODE=full
+  ufw() { printf 'ufw %s\n' "$*"; }
+  iptables() { printf -- '-A POSTROUTING -o eth0 -j MASQUERADE\n'; }
+  apply_ufw_nat eth0
+  grep -q '# BEGIN wg-manager wg0' "$rules"
+  grep -q -- '-A POSTROUTING -o eth0 -j MASQUERADE' "$rules"
+  awk '/# BEGIN wg-manager/{b=NR} /^\*filter/{f=NR} END{exit !(b && f && b<f)}' "$rules"
+  [ -f "$WG_MANAGER_STATE_ROOT/interfaces/wg0/ufw-nat.rules" ]
+  [ "$(stat -c %a "$rules")" = "$orig_mode" ]
+  apply_ufw_nat eth0
+  [ "$(grep -c '# BEGIN wg-manager wg0' "$rules")" = 1 ]
+  remove_ufw_nat
+  run grep -q MASQUERADE "$rules"
+  [ "$status" -ne 0 ]
+  [ "$(cat "$rules")" = "$(printf '*filter\n:ufw-before-input - [0:0]\nCOMMIT\n')" ]
+  [ "$(stat -c %a "$rules")" = "$orig_mode" ]
+}

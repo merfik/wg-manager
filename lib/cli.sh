@@ -20,13 +20,19 @@ cli_parse() {
         WG_PRESET_FILE=$2
         shift 2
         ;;
-      --install|--add|--remove|--list|--status|--doctor|--backup|--restore|--uninstall)
+      --install|--add|--remove|--list|--status|--doctor|--backup|--restore|--uninstall|--reconfigure)
         CLI_COMMAND=$1
         shift
         ;;
       --iface)
         [[ $# -ge 2 ]] || die "--iface requires an interface name"
         CLI_IFACE=$2
+        shift 2
+        ;;
+      --mode)
+        [[ $# -ge 2 ]] || die "--mode requires hub or full"
+        [[ $2 =~ ^(hub|full)$ ]] || die "--mode must be hub or full"
+        MODE_ARG=$2
         shift 2
         ;;
       --dry-run)
@@ -48,8 +54,21 @@ cli_parse() {
 cli_load_preset() {
   [[ -n $WG_PRESET_FILE ]] || return 0
   [[ -f $WG_PRESET_FILE ]] || die "Preset file '$WG_PRESET_FILE' not found"
-  # shellcheck source=/dev/null
-  . "$WG_PRESET_FILE"
+  local key
+  parse_kv_file "$WG_PRESET_FILE" || die "Preset file '$WG_PRESET_FILE' has a malformed line (expected KEY=VALUE)."
+  for key in "${!KV[@]}"; do
+    case $key in
+      WG_IFACE|WG_MODE|WG_ENDPOINT|WG_SUBNET|WG_PORT|WG_MTU|WG_KEEPALIVE|WG_IPV6|WG_DNS|WG_DNS_CUSTOM|WG_SPLIT_TUNNEL|WG_SPLIT_ROUTES|WG_WAN_IFACE|WG_CLIENT|WG_PSK|WG_EXPORT_DIR|WG_QR|WG_DRY_RUN|WG_BACKUP_FILE)
+        printf -v "$key" '%s' "${KV[$key]}"
+        ;;
+      WG_*)
+        log WARN "Ignoring unknown preset variable '$key' in $WG_PRESET_FILE."
+        ;;
+      *)
+        log WARN "Ignoring non-WG variable '$key' in $WG_PRESET_FILE."
+        ;;
+    esac
+  done
 
   # Map preset variables (WG_*) onto the globals the command functions use.
   IFACE=${WG_IFACE:-$IFACE}
@@ -75,6 +94,10 @@ cli_load_preset() {
   DRY_RUN=$([[ ${WG_DRY_RUN:-} == yes ]] && echo 1 || echo 0)
   ARGS=()
   [[ -n ${WG_BACKUP_FILE:-} ]] && ARGS=("$WG_BACKUP_FILE")
+  if [[ $CLI_COMMAND == --reconfigure && -n ${WG_MODE:-} ]]; then
+    MODE_ARG=$WG_MODE
+  fi
+  [[ -n $CLIENT ]] && { validate_client || die "Invalid WG_CLIENT '$CLIENT' in preset '$WG_PRESET_FILE'."; }
   return 0
 }
 
@@ -119,6 +142,9 @@ cli_dispatch() {
       ;;
     --uninstall)
       command_uninstall
+      ;;
+    --reconfigure)
+      command_reconfigure
       ;;
     *)
       return 1
