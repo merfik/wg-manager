@@ -140,6 +140,20 @@ setup() {
   [[ "$output" == *"replaced by interactive menus"* ]]
 }
 
+@test "unknown CLI arguments are rejected without dispatch" {
+  command_remove() { printf 'remove-dispatched\n'; }
+  run main --remove --iface wg0 --unexpected
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Unknown or invalid command-line arguments"* ]]
+  [[ "$output" != *"remove-dispatched"* ]]
+}
+
+@test "multiple CLI commands are rejected" {
+  run main --remove --add --iface wg0
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Only one command may be specified"* ]]
+}
+
 @test "validated menu prompts retry invalid values" {
   menu_prompt_validated PORT 'WireGuard port' 51820 validate_port < <(printf '70000\n51820\n')
   [ "$PORT" = 51820 ]
@@ -469,6 +483,40 @@ setup() {
   grep -q 'net.ipv4.ip_forward=1' "$WG_MANAGER_SYSCTL_DIR/99-wg-manager-wg0.conf"
 }
 
+@test "restore removes stale interface and client state" {
+  require_root() { return 0; }
+  enable_forwarding() { :; }
+  add_firewall_rules() { :; }
+  install_service() { :; }
+  mkdir -p "$WG_MANAGER_STATE_ROOT/interfaces/wg0" "$WG_MANAGER_STATE_ROOT/clients/wg0" "$WG_MANAGER_SYSCTL_DIR"
+  printf 'stale\n' >"$WG_MANAGER_STATE_ROOT/interfaces/wg0/stale.key"
+  printf 'stale\n' >"$WG_MANAGER_STATE_ROOT/clients/wg0/laptop.conf"
+  printf 'stale\n' >"$WG_MANAGER_STATE_ROOT/clients/wg0/laptop.private"
+  printf 'stale\n' >"$WG_MANAGER_SYSCTL_DIR/99-wg-manager-wg0.conf"
+
+  local stage="$BATS_TEST_TMPDIR/stale-restore"
+  mkdir -p "$stage/${WG_MANAGER_STATE_ROOT#/}/interfaces/wg0" "$stage/${WG_MANAGER_ETC_ROOT#/}" \
+    "$stage/${WG_MANAGER_STATE_ROOT#/}/clients/wg0"
+  printf 'MODE=hub\nIFACE=wg0\nSUBNET=10.7.0.0/24\nIPV6=\nPORT=51820\nENDPOINT=192.0.2.10\nDNS=system\nMTU=1420\nKEEPALIVE=25\nWAN=\nFIREWALL=iptables\nSERVICE_BACKEND=systemd\nSPLIT_TUNNEL=0\nROUTES=\nPSK=0\nCREATED_AT=2026-01-01T00:00:00Z\n' >"$stage/${WG_MANAGER_STATE_ROOT#/}/interfaces/wg0/metadata"
+  printf '[Interface]\nAddress = 10.7.0.1/24\nPrivateKey = k\nListenPort = 51820\n' >"$stage/${WG_MANAGER_ETC_ROOT#/}/wg0.conf"
+  printf 'Address = 10.7.0.2/24\n' >"$stage/${WG_MANAGER_STATE_ROOT#/}/clients/wg0/phone.conf"
+  tar -czf "$BATS_TEST_TMPDIR/stale.tar.gz" -C "$stage" \
+    "${WG_MANAGER_STATE_ROOT#/}/interfaces/wg0" \
+    "${WG_MANAGER_STATE_ROOT#/}/clients/wg0" \
+    "${WG_MANAGER_ETC_ROOT#/}/wg0.conf"
+
+  ARGS=("$BATS_TEST_TMPDIR/stale.tar.gz")
+  YES=1
+  MODE=
+  SUBNET=
+  command_restore
+  [ ! -e "$WG_MANAGER_STATE_ROOT/interfaces/wg0/stale.key" ]
+  [ ! -e "$WG_MANAGER_STATE_ROOT/clients/wg0/laptop.conf" ]
+  [ ! -e "$WG_MANAGER_STATE_ROOT/clients/wg0/laptop.private" ]
+  [ -f "$WG_MANAGER_STATE_ROOT/clients/wg0/phone.conf" ]
+  [ ! -e "$WG_MANAGER_SYSCTL_DIR/99-wg-manager-wg0.conf" ]
+}
+
 @test "restore dry run validates archive and preserves existing exit trap" {
   require_root() { return 0; }
   local stage="$BATS_TEST_TMPDIR/dry-run-restore"
@@ -582,6 +630,27 @@ setup() {
   grep -q '^--permanent --zone=external --remove-masquerade$' "$calls"
   grep -q '^--reload$' "$calls"
   ! grep -q -- '--remove-port' "$calls"
+}
+
+@test "firewalld cleanup preserves NAT used by another full-tunnel interface" {
+  local calls="$BATS_TEST_TMPDIR/firewalld-shared-calls"
+  : >"$calls"
+  firewall-cmd() { printf '%s\n' "$*" >>"$calls"; }
+  mkdir -p "$WG_MANAGER_STATE_ROOT/interfaces/wg0" "$WG_MANAGER_STATE_ROOT/interfaces/wg1"
+  printf 'IFACE=wg0\nMODE=full\nWAN=eth0\n' >"$WG_MANAGER_STATE_ROOT/interfaces/wg0/metadata"
+  printf 'IFACE=wg1\nMODE=full\nWAN=eth0\n' >"$WG_MANAGER_STATE_ROOT/interfaces/wg1/metadata"
+  IFACE=wg0
+  WAN=eth0
+  remove_full_tunnel_rules firewalld
+  ! grep -q -- '--remove-interface=eth0' "$calls"
+  ! grep -q -- '--remove-masquerade' "$calls"
+  grep -q '^--reload$' "$calls"
+
+  printf 'IFACE=wg1\nMODE=hub\nWAN=\n' >"$WG_MANAGER_STATE_ROOT/interfaces/wg1/metadata"
+  : >"$calls"
+  remove_full_tunnel_rules firewalld
+  grep -q '^--permanent --zone=external --remove-interface=eth0$' "$calls"
+  grep -q '^--permanent --zone=external --remove-masquerade$' "$calls"
 }
 
 @test "reconfiguring full to hub preserves baseline firewall rules" {

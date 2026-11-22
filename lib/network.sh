@@ -288,6 +288,22 @@ add_firewall_rules() {
       ;;
   esac
 }
+firewalld_wan_still_used() {
+  local wan=$1 exclude=$2 metadata iface
+  for metadata in "$STATE_ROOT"/interfaces/*/metadata; do
+    [[ -f $metadata ]] || continue
+    iface=${metadata%/metadata}
+    iface=${iface##*/}
+    [[ $iface == "$exclude" ]] && continue
+    parse_kv_file "$metadata" || die "Could not safely inspect metadata for managed interface '$iface'."
+    [[ ${KV[IFACE]:-$iface} == "$iface" ]] ||
+      die "Metadata for '$iface' names a mismatched interface. Refusing to remove shared Firewalld rules."
+    if [[ ${KV[MODE]:-} == full && ${KV[WAN]:-} == "$wan" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
 remove_full_tunnel_rules() {
   local firewall=$1
   case "$firewall" in
@@ -297,10 +313,12 @@ remove_full_tunnel_rules() {
       remove_ufw_nat
       ;;
     firewalld)
-      firewall-cmd --permanent --zone=external --remove-interface="$WAN" >/dev/null ||
-        die "Could not remove WAN interface '$WAN' from the firewalld external zone."
-      firewall-cmd --permanent --zone=external --remove-masquerade >/dev/null ||
-        die "Could not disable firewalld masquerading."
+      if ! firewalld_wan_still_used "$WAN" "$IFACE"; then
+        firewall-cmd --permanent --zone=external --remove-interface="$WAN" >/dev/null ||
+          die "Could not remove WAN interface '$WAN' from the firewalld external zone."
+        firewall-cmd --permanent --zone=external --remove-masquerade >/dev/null ||
+          die "Could not disable firewalld masquerading."
+      fi
       firewall-cmd --reload >/dev/null || die "Could not reload firewalld after removing full-tunnel rules."
       ;;
     iptables)
@@ -327,10 +345,12 @@ remove_firewall_rules() {
       firewall-cmd --permanent --zone=trusted --remove-interface="$IFACE" >/dev/null 2>&1 ||
         die "Could not remove '$IFACE' from the firewalld trusted zone."
       if [[ $MODE == full ]]; then
-        firewall-cmd --permanent --zone=external --remove-interface="$WAN" >/dev/null 2>&1 ||
-          die "Could not remove '$WAN' from the firewalld external zone."
-        firewall-cmd --permanent --zone=external --remove-masquerade >/dev/null 2>&1 ||
-          die "Could not disable firewalld masquerading."
+        if ! firewalld_wan_still_used "$WAN" "$IFACE"; then
+          firewall-cmd --permanent --zone=external --remove-interface="$WAN" >/dev/null 2>&1 ||
+            die "Could not remove '$WAN' from the firewalld external zone."
+          firewall-cmd --permanent --zone=external --remove-masquerade >/dev/null 2>&1 ||
+            die "Could not disable firewalld masquerading."
+        fi
       fi
       firewall-cmd --reload >/dev/null 2>&1 || die "Could not reload firewalld after rule removal."
       ;;

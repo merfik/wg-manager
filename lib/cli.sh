@@ -21,6 +21,7 @@ cli_parse() {
         shift 2
         ;;
       --install|--add|--remove|--list|--status|--doctor|--backup|--restore|--uninstall|--reconfigure)
+        [[ -z $CLI_COMMAND ]] || die "Only one command may be specified."
         CLI_COMMAND=$1
         shift
         ;;

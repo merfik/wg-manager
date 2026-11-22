@@ -205,6 +205,8 @@ command_restore() {
     rm -rf "$stage"
     die "Extraction of '$file' failed."
   fi
+  rm -rf "$STATE_ROOT/interfaces/$IFACE" "$STATE_ROOT/clients/$IFACE"
+  rm -f "$SYSCTL_DIR/99-wg-manager-$IFACE.conf"
   install -d -m 700 "$ETC_ROOT" "$STATE_ROOT/interfaces/$IFACE" "$STATE_ROOT/clients/$IFACE" "$SYSCTL_DIR" || {
     rm -rf "$stage"
     die "Could not create managed directories for '$IFACE'."

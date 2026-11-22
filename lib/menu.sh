@@ -333,27 +333,48 @@ main_menu() {
 }
 
 main() {
-  cli_parse "$@" || true  # unknown/legacy flags fall through to the legacy path
-  if [[ -n $CLI_COMMAND ]]; then
-    cli_load_preset
-    cli_apply_flags
-    cli_dispatch
-    return $?
+  if (($#)); then
+    if [[ $1 == --help || $1 == -h || $1 == --prepare || $1 == --prepare-install ]]; then
+      case $1 in
+        --help|-h)
+          (($# == 1)) || die "Unknown or invalid command-line arguments."
+          usage
+          return 0
+          ;;
+        --prepare)
+          (($# == 1)) || die "Unknown or invalid command-line arguments."
+          command_prepare check
+          return 0
+          ;;
+        --prepare-install)
+          (($# == 1)) || die "Unknown or invalid command-line arguments."
+          require_root
+          command_prepare install
+          return 0
+          ;;
+      esac
+    fi
+  fi
+  if cli_parse "$@"; then
+    if [[ -n $CLI_COMMAND ]]; then
+      cli_load_preset
+      cli_apply_flags
+      cli_dispatch
+      return $?
+    fi
+  else
+    if (($#)); then
+      case $1 in
+        install|add|remove|list|status|doctor|backup|restore|uninstall|reconfigure)
+          die "The command-line interface has been replaced by interactive menus. Run '$PROGRAM' without arguments."
+          ;;
+        *)
+          die "Unknown or invalid command-line arguments: $*"
+          ;;
+      esac
+    fi
   fi
   if (($#)); then
-    if (($# == 1)) && [[ $1 == --help || $1 == -h ]]; then
-      usage
-      return 0
-    fi
-    if (($# == 1)) && [[ $1 == --prepare ]]; then
-      command_prepare check
-      return 0
-    fi
-    if (($# == 1)) && [[ $1 == --prepare-install ]]; then
-      require_root
-      command_prepare install
-      return 0
-    fi
     die "The command-line interface has been replaced by interactive menus. Run '$PROGRAM' without arguments."
   fi
   main_menu
